@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import io
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
 import tensorflow as tf
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from PIL import Image
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CONFIG_PATH = BASE_DIR / "configs" / "settings.json"
+REPO_ROOT = BASE_DIR.parent
+FRONTEND_DIR = REPO_ROOT / "frontend"
 
 
 def load_settings() -> dict[str, object]:
@@ -25,9 +27,12 @@ MODEL_PATH = BASE_DIR / str(SETTINGS["model_path"])
 LABELS_PATH = BASE_DIR / str(SETTINGS["labels_path"])
 IMAGES_DIR = BASE_DIR / str(SETTINGS["images_dir"])
 RECEIVED_DIR = BASE_DIR / str(SETTINGS.get("received_dir", "received"))
+DETECTIONS_PATH = RECEIVED_DIR / "detections.json"
+DEVICE_STATE_PATH = RECEIVED_DIR / "device_state.json"
 IMAGE_SIZE = tuple(SETTINGS["image_size"])
 HOST = str(SETTINGS["host"])
 PORT = int(SETTINGS["port"])
+HEARTBEAT_TIMEOUT_SECONDS = int(SETTINGS.get("heartbeat_timeout_seconds", 150))
 
 app = Flask(__name__)
 
@@ -45,6 +50,10 @@ def ensure_required_files() -> None:
 def ensure_directories() -> None:
     IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     RECEIVED_DIR.mkdir(parents=True, exist_ok=True)
+    if not DETECTIONS_PATH.exists():
+        DETECTIONS_PATH.write_text('{"detections": []}\n', encoding="utf-8")
+    if not DEVICE_STATE_PATH.exists():
+        DEVICE_STATE_PATH.write_text('{"last_heartbeat_at": null}\n', encoding="utf-8")
 
 
 def load_labels() -> list[str]:
@@ -89,6 +98,102 @@ def save_received_image(image_bytes: bytes) -> Path:
     return output_path
 
 
+def load_detection_log() -> dict[str, list[dict[str, object]]]:
+    try:
+        payload = json.loads(DETECTIONS_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        payload = {"detections": []}
+
+    detections = payload.get("detections")
+    if not isinstance(detections, list):
+        detections = []
+
+    return {"detections": detections}
+
+
+def append_detection_record(
+    *,
+    saved_path: Path,
+    raw_label: str,
+    result: str,
+    confidence: float,
+) -> dict[str, object]:
+    detection_log = load_detection_log()
+    record = {
+        "saved_as": saved_path.name,
+        "received_url": f"/received/{saved_path.name}",
+        "raw": raw_label,
+        "result": result,
+        "confidence": confidence,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    updated = [record, *detection_log["detections"]][:50]
+    DETECTIONS_PATH.write_text(
+        json.dumps({"detections": updated}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return record
+
+
+def count_received_images() -> int:
+    image_suffixes = {".jpg", ".jpeg", ".png", ".webp"}
+    return sum(1 for path in RECEIVED_DIR.iterdir() if path.is_file() and path.suffix.lower() in image_suffixes)
+
+
+def load_device_state() -> dict[str, object]:
+    try:
+        payload = json.loads(DEVICE_STATE_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        payload = {"last_heartbeat_at": None}
+
+    if not isinstance(payload, dict):
+        payload = {"last_heartbeat_at": None}
+
+    return payload
+
+
+def write_device_state(*, heartbeat_at: datetime | None) -> None:
+    DEVICE_STATE_PATH.write_text(
+        json.dumps(
+            {
+                "last_heartbeat_at": heartbeat_at.isoformat(timespec="seconds") if heartbeat_at else None,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def get_device_status() -> dict[str, object]:
+    device_state = load_device_state()
+    last_heartbeat_raw = device_state.get("last_heartbeat_at")
+
+    if not isinstance(last_heartbeat_raw, str) or not last_heartbeat_raw:
+        return {
+            "online": False,
+            "last_heartbeat_at": None,
+            "timeout_seconds": HEARTBEAT_TIMEOUT_SECONDS,
+        }
+
+    try:
+        last_heartbeat_at = datetime.fromisoformat(last_heartbeat_raw)
+    except ValueError:
+        return {
+            "online": False,
+            "last_heartbeat_at": None,
+            "timeout_seconds": HEARTBEAT_TIMEOUT_SECONDS,
+        }
+
+    now = datetime.now()
+    online = now - last_heartbeat_at <= timedelta(seconds=HEARTBEAT_TIMEOUT_SECONDS)
+    return {
+        "online": online,
+        "last_heartbeat_at": last_heartbeat_at.isoformat(timespec="seconds"),
+        "timeout_seconds": HEARTBEAT_TIMEOUT_SECONDS,
+    }
+
+
 def resolve_image_path(filename: str) -> Path:
     candidate = (IMAGES_DIR / filename).resolve()
     images_root = IMAGES_DIR.resolve()
@@ -104,6 +209,52 @@ def health() -> tuple[dict[str, str], int]:
     return {"status": "ok"}, 200
 
 
+@app.get("/status")
+def status() -> tuple[dict[str, object], int]:
+    return {
+        "backend": {
+            "healthy": True,
+            "checked_at": datetime.now().isoformat(timespec="seconds"),
+        },
+        "esp32": get_device_status(),
+        "capture_buffer": {
+            "count": count_received_images(),
+        },
+    }, 200
+
+
+@app.post("/device/heartbeat")
+def device_heartbeat() -> tuple[dict[str, object], int]:
+    heartbeat_at = datetime.now()
+    write_device_state(heartbeat_at=heartbeat_at)
+    return {
+        "status": "ok",
+        "received_at": heartbeat_at.isoformat(timespec="seconds"),
+        "timeout_seconds": HEARTBEAT_TIMEOUT_SECONDS,
+    }, 200
+
+
+@app.get("/")
+@app.get("/dashboard")
+def dashboard() -> object:
+    return send_from_directory(FRONTEND_DIR, "index.html")
+
+
+@app.get("/dashboard/<path:filename>")
+def dashboard_assets(filename: str) -> object:
+    return send_from_directory(FRONTEND_DIR, filename)
+
+
+@app.get("/received/<path:filename>")
+def received_image(filename: str) -> object:
+    return send_from_directory(RECEIVED_DIR, filename)
+
+
+@app.get("/detections")
+def detections() -> tuple[dict[str, list[dict[str, object]]], int]:
+    return load_detection_log(), 200
+
+
 @app.post("/predict")
 def predict() -> tuple[object, int]:
     image_bytes = request.get_data(cache=False, as_text=False, parse_form_data=False)
@@ -113,16 +264,26 @@ def predict() -> tuple[object, int]:
 
     try:
         saved_path = save_received_image(image_bytes)
-        raw_label, _confidence = predict_image(image_bytes)
+        raw_label, confidence = predict_image(image_bytes)
+        result = clean_label(raw_label)
+        detection = append_detection_record(
+            saved_path=saved_path,
+            raw_label=raw_label,
+            result=result,
+            confidence=confidence,
+        )
     except Exception as exc:  # pragma: no cover - defensive API error handling
         return jsonify({"error": str(exc)}), 400
 
     return jsonify(
         {
             "raw": raw_label,
-            "result": clean_label(raw_label),
+            "result": result,
+            "confidence": confidence,
             "saved_as": saved_path.name,
             "saved_path": str(saved_path),
+            "received_url": f"/received/{saved_path.name}",
+            "created_at": detection["created_at"],
         },
     ), 200
 
@@ -137,12 +298,17 @@ def predict_file() -> tuple[object, int]:
 
     try:
         image_path = resolve_image_path(filename)
-        raw_label, _confidence = predict_image(image_path.read_bytes())
+        raw_label, confidence = predict_image(image_path.read_bytes())
     except Exception as exc:  # pragma: no cover - defensive API error handling
         return jsonify({"error": str(exc)}), 400
 
     return jsonify(
-        {"filename": filename, "raw": raw_label, "result": clean_label(raw_label)},
+        {
+            "filename": filename,
+            "raw": raw_label,
+            "result": clean_label(raw_label),
+            "confidence": confidence,
+        },
     ), 200
 
 
