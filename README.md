@@ -14,16 +14,22 @@ This repository contains:
 
 - `hw_code/`: ESP32-CAM Arduino sketch for the smart dustbin hardware
 - `ml_backend/`: Python Flask server that receives images and classifies them as `bio` or `nonbio`
+- `frontend/`: Live dashboard served by the Flask backend
 
 ## Repository Layout
 
 ```text
 esp32-smart-waste-segregator/
+├── frontend/
+│   ├── app.js
+│   ├── index.html
+│   └── styles.css
 ├── hw_code/
 │   └── hw_code.ino
 ├── ml_backend/
 │   ├── configs/
 │   ├── models/
+│   ├── received/
 │   ├── server/
 │   ├── README.md
 │   ├── pyproject.toml
@@ -38,6 +44,23 @@ esp32-smart-waste-segregator/
 3. The backend runs the Teachable Machine model.
 4. The backend returns `bio` or `nonbio`.
 5. The servo rotates to the matching side of the bin.
+6. The backend stores the received image and appends the classification result to a JSON log.
+7. The dashboard reads backend status, recent detections, and saved images from Flask routes.
+
+## Dashboard Features
+
+The frontend dashboard is served by the Flask backend and includes:
+
+- latest classified frame view
+- predicted class and confidence display
+- bin fill level indicator derived from the bin sensor distance
+- backend health status
+- ESP32 heartbeat status
+- capture buffer count from `ml_backend/received/`
+- manual image upload and analysis
+- recent detections loaded from the persisted detection log
+- modal detail view for detections
+- page-load animation and analysis loading overlay
 
 ## What You Need
 
@@ -101,7 +124,7 @@ python server/main.py
 You should now have the API available at:
 
 ```text
-http://<your-machine-ip>:5000/predict
+http://<your-machine-ip>:5000/
 ```
 
 Quick health check:
@@ -109,6 +132,23 @@ Quick health check:
 ```bash
 curl http://127.0.0.1:5000/health
 ```
+
+Useful routes:
+
+- `GET /`: dashboard
+- `GET /dashboard`: dashboard alias
+- `GET /health`: simple health route
+- `GET /status`: backend health, ESP32 heartbeat state, and capture buffer count
+- `GET /detections`: persisted detection log
+- `GET /received/<filename>`: saved received image
+- `POST /predict`: classify raw image bytes
+- `POST /predict-file`: classify an image already present in `ml_backend/images/`
+- `POST /device/heartbeat`: ESP32 heartbeat endpoint
+
+Persistent files created by the backend:
+
+- `ml_backend/received/detections.json`: recent classification results and confidence scores
+- `ml_backend/received/device_state.json`: last ESP32 heartbeat timestamp
 
 ## 3. Update The Arduino Sketch
 
@@ -125,6 +165,22 @@ const char *serverUrl = "http://192.168.1.10:5000/predict";
 ```
 
 The laptop and ESP32-CAM must be on the same network.
+
+For device heartbeat, the ESP32 should also periodically `POST` to:
+
+```text
+http://<your-machine-ip>:5000/device/heartbeat
+```
+
+Recommended heartbeat interval:
+
+- every `60` to `120` seconds
+
+Current backend timeout:
+
+- `150` seconds
+
+If no heartbeat is received within that timeout, the dashboard shows the ESP32 as offline.
 
 ## 4. Set Up Arduino CLI
 
@@ -179,7 +235,13 @@ source .venv/bin/activate
 python server/main.py
 ```
 
-2. In another terminal, compile and upload the sketch:
+2. Open the dashboard:
+
+```text
+http://127.0.0.1:5000/
+```
+
+3. In another terminal, compile and upload the sketch:
 
 ```bash
 cd /path/to/esd_smart_dustbin
@@ -188,16 +250,32 @@ arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32cam hw_code
 arduino-cli monitor -p /dev/ttyUSB0 -c baudrate=115200
 ```
 
-3. Trigger the bin and watch:
+4. Trigger the bin and watch:
 
 - serial output from the ESP32-CAM
 - received images saved under `ml_backend/received/`
 - backend responses from `/predict`
+- detection history stored in `ml_backend/received/detections.json`
+- ESP32 heartbeat state stored in `ml_backend/received/device_state.json`
+- live status and recent detections on the dashboard
+
+## Frontend Notes
+
+The dashboard is designed to be used through Flask, not by opening `frontend/index.html` directly in the browser.
+
+Manual test flow in the dashboard:
+
+1. Choose a local image
+2. The preview appears only after a file is selected
+3. Click `Analyze Selected Image`
+4. The backend runs inference and saves the image
+5. The dashboard refreshes the persisted recent detections list
 
 ## Troubleshooting
 
 - If the backend fails on startup, check that `ml_backend/models/keras_model.h5` and `ml_backend/models/labels.txt` exist.
 - If the ESP32-CAM cannot classify images, verify that `serverUrl` points to the correct machine IP and port.
+- If the dashboard shows the ESP32 as offline, confirm the device is posting heartbeats to `/device/heartbeat`.
 - If upload fails, confirm the serial port with `arduino-cli board list`.
 - If serial output is unreadable, make sure the monitor baud is `115200`.
 - If TensorFlow install fails on a newer Python version, use Python `3.11`.
