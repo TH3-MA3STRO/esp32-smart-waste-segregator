@@ -5,5 +5,8 @@
   "model_path": "models/keras_model.h5",
   "labels_path": "models/labels.txt",
   "images_dir": "images",
-  "received_dir": "received"
+  "received_dir": "received",
+  "heartbeat_timeout_seconds": 150,
+  "bin_empty_distance_cm": 10.5,
+  "bin_full_distance_cm": 2.0
 }

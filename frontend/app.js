@@ -1,45 +1,18 @@
 const demoFrames = [
   {
-    image:
-      "https://images.unsplash.com/photo-1532996122724-e3c354a0b15b?auto=format&fit=crop&w=1200&q=80",
-    imageName: "frame-20260402-1042.jpg",
-    result: "bio",
-    confidence: 0.96,
-    detail: "Organic waste detected. Servo routes left.",
-    frontDistance: "11 cm",
-    binDistance: "38 cm",
-    servoPosition: "Left Gate",
-    queueState: "Settled",
-    statusText: "Detection Confirmed",
-    timestamp: "2026-04-02 10:42:11",
-  },
-  {
-    image:
-      "https://images.unsplash.com/photo-1513467535987-fd81bc7d62f8?auto=format&fit=crop&w=1200&q=80",
-    imageName: "frame-20260402-1045.jpg",
-    result: "nonbio",
-    confidence: 0.91,
-    detail: "Plastic-like object detected. Servo routes right.",
-    frontDistance: "9 cm",
-    binDistance: "36 cm",
-    servoPosition: "Right Gate",
-    queueState: "Cycle Complete",
-    statusText: "Routing to Nonbio",
-    timestamp: "2026-04-02 10:45:39",
-  },
-  {
-    image:
-      "https://images.unsplash.com/photo-1530587191325-3db32d826c18?auto=format&fit=crop&w=1200&q=80",
-    imageName: "frame-20260402-1048.jpg",
-    result: "bio",
-    confidence: 0.88,
-    detail: "Compostable material detected. Gate returned to neutral.",
-    frontDistance: "13 cm",
-    binDistance: "34 cm",
+    image: "",
+    imageName: "Waiting for first detection",
+    result: "unknown",
+    confidence: 0,
+    detail: "Dashboard is ready. Live classification data appears after the first capture.",
+    frontDistance: "--",
+    binDistance: "--",
+    fillPercent: null,
+    fillDetail: "Waiting for device heartbeat telemetry.",
     servoPosition: "Neutral",
     queueState: "Awaiting Object",
-    statusText: "Idle Monitoring",
-    timestamp: "2026-04-02 10:48:04",
+    statusText: "System Ready",
+    timestamp: "Waiting for sync",
   },
 ];
 
@@ -100,22 +73,30 @@ function extractCentimeters(value) {
   return Number.isFinite(numeric) ? numeric : null;
 }
 
-function describeFillLevel(distanceText) {
-  const distance = extractCentimeters(distanceText);
+function parseNullableNumber(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
 
-  if (distance === null) {
-    return { percent: 0, detail: "Fill level unavailable.", color: "linear-gradient(90deg, #75e0bf, #84de96)" };
+function formatDistance(distanceCm) {
+  const numeric = parseNullableNumber(distanceCm);
+  return numeric === null ? "--" : `${numeric} cm`;
+}
+
+function describeFillLevel(fillPercent, detailText) {
+  if (!Number.isFinite(fillPercent)) {
+    return {
+      percent: 0,
+      detail: detailText || "Fill level unavailable.",
+      color: "linear-gradient(90deg, #75e0bf, #84de96)",
+    };
   }
 
-  const emptyDistance = 40;
-  const fullDistance = 5;
-  const ratio = (emptyDistance - distance) / (emptyDistance - fullDistance);
-  const percent = Math.max(0, Math.min(100, Math.round(ratio * 100)));
-
+  const percent = Math.max(0, Math.min(100, Math.round(fillPercent)));
   if (percent >= 85) {
     return {
       percent,
-      detail: "Bin is nearly full and should be emptied soon.",
+      detail: detailText || "Bin is nearly full and should be emptied soon.",
       color: "linear-gradient(90deg, #ff9a52, #ff735b)",
     };
   }
@@ -123,14 +104,14 @@ function describeFillLevel(distanceText) {
   if (percent >= 55) {
     return {
       percent,
-      detail: "Bin is over half full.",
+      detail: detailText || "Bin is over half full.",
       color: "linear-gradient(90deg, #ffb36a, #ffd36f)",
     };
   }
 
   return {
     percent,
-    detail: "Bin has plenty of remaining space.",
+    detail: detailText || "Bin has plenty of remaining space.",
     color: "linear-gradient(90deg, #75e0bf, #84de96)",
   };
 }
@@ -213,7 +194,11 @@ function closeDetailModal() {
 }
 
 function renderFrame(frame) {
-  cameraImage.src = frame.image;
+  if (frame.image) {
+    cameraImage.src = frame.image;
+  } else {
+    cameraImage.removeAttribute("src");
+  }
   imageName.textContent = frame.imageName;
   resultPill.textContent = frame.result.toUpperCase();
   resultPill.className = frame.result === "nonbio" ? "result-pill nonbio" : "result-pill";
@@ -227,7 +212,7 @@ function renderFrame(frame) {
 
   frontDistance.textContent = frame.frontDistance;
   binDistance.textContent = frame.binDistance;
-  const fillState = describeFillLevel(frame.binDistance);
+  const fillState = describeFillLevel(frame.fillPercent, frame.fillDetail);
   fillPercentage.textContent = `${fillState.percent}%`;
   fillBar.style.width = `${fillState.percent}%`;
   fillBar.style.background = fillState.color;
@@ -270,6 +255,10 @@ function applyStatus(payload) {
   const deviceOnline = Boolean(payload?.esp32?.online);
   const lastHeartbeat = payload?.esp32?.last_heartbeat_at;
   const timeoutSeconds = payload?.esp32?.timeout_seconds ?? 150;
+  const deviceStatus = payload?.esp32?.device_status || "unknown";
+  const binDistanceCm = parseNullableNumber(payload?.esp32?.bin?.distance_cm);
+  const binFillPercent = parseNullableNumber(payload?.esp32?.bin?.fill_percent);
+  const binFillDetail = payload?.esp32?.bin?.detail;
   const captureCount = Number(payload?.capture_buffer?.count ?? 0);
 
   backendHealthValue.textContent = backendHealthy ? "Healthy" : "Down";
@@ -277,11 +266,18 @@ function applyStatus(payload) {
 
   deviceHealthValue.textContent = deviceOnline ? "Online" : "Offline";
   deviceHealthDetail.textContent = lastHeartbeat
-    ? `Last heartbeat: ${lastHeartbeat} | timeout ${timeoutSeconds}s`
+    ? `Last heartbeat: ${lastHeartbeat} | ${deviceStatus} | timeout ${timeoutSeconds}s`
     : `No heartbeat yet | timeout ${timeoutSeconds}s`;
 
   bufferCountValue.textContent = `${captureCount} item${captureCount === 1 ? "" : "s"}`;
   bufferCountDetail.textContent = "Saved image files currently present in `received/`.";
+
+  binDistance.textContent = formatDistance(binDistanceCm);
+  const fillState = describeFillLevel(binFillPercent, binFillDetail);
+  fillPercentage.textContent = `${fillState.percent}%`;
+  fillBar.style.width = `${fillState.percent}%`;
+  fillBar.style.background = fillState.color;
+  fillDetail.textContent = fillState.detail;
 }
 
 async function loadDetections() {
@@ -309,6 +305,8 @@ async function loadDetections() {
         detail: `Model returned ${String(latest.result || "unknown").toUpperCase()} from label ${latest.raw}.`,
         frontDistance: frontDistance.textContent,
         binDistance: binDistance.textContent,
+        fillPercent: extractCentimeters(fillPercentage.textContent),
+        fillDetail: fillDetail.textContent,
         servoPosition:
           latest.result === "bio" ? "Left Gate" : latest.result === "nonbio" ? "Right Gate" : "Neutral",
         queueState: "Prediction Complete",
@@ -380,6 +378,8 @@ async function analyzeSelectedImage() {
       detail: `Model returned ${result.toUpperCase()} from label ${payload.raw}.`,
       frontDistance: frontDistance.textContent,
       binDistance: binDistance.textContent,
+      fillPercent: extractCentimeters(fillPercentage.textContent),
+      fillDetail: fillDetail.textContent,
       servoPosition: result === "bio" ? "Left Gate" : result === "nonbio" ? "Right Gate" : "Neutral",
       queueState: "Prediction Complete",
       statusText: `Live Result: ${result.toUpperCase()}`,
@@ -418,12 +418,6 @@ loadDetections();
 checkHealth();
 window.setInterval(checkHealth, 15000);
 analyzeButton.disabled = true;
-window.addEventListener("load", () => {
-  window.setTimeout(() => {
-    bootScreen.classList.add("hidden");
-    document.body.classList.remove("app-loading");
-  }, 1200);
-});
 window.addEventListener("load", () => {
   window.setTimeout(() => {
     bootScreen.classList.add("hidden");

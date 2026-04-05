@@ -6,7 +6,9 @@
 // ---------------- WIFI ----------------
 const char *ssid = "SM";
 const char *password = "vdus7030";
-const char *serverUrl = "http://192.168.124.215:5000/predict";
+const char *serverBaseUrl = "http://192.168.124.215:5000";
+const char *predictUrl = "http://192.168.124.215:5000/predict";
+const char *heartbeatUrl = "http://192.168.124.215:5000/device/heartbeat";
 
 // ---------------- PINS ----------------
 #define TRIG 13
@@ -16,6 +18,20 @@ const char *serverUrl = "http://192.168.124.215:5000/predict";
 
 Servo myServo;
 bool detected = false;
+unsigned long lastHeartbeatSentAt = 0;
+long lastValidBinDistance = -1;
+int currentServoAngle = 90;
+
+const unsigned long HEARTBEAT_INTERVAL_MS = 150000UL;
+const float BIN_EMPTY_DISTANCE_CM = 10.5F;
+const float BIN_FULL_DISTANCE_CM = 2.0F;
+const float FRONT_OBJECT_DETECTED_CM = 4.5F;
+const float FRONT_CLEAR_CM = 5.5F;
+const int SERVO_LEFT_ANGLE = 20;
+const int SERVO_CENTER_ANGLE = 90;
+const int SERVO_RIGHT_ANGLE = 160;
+const int SERVO_STEP_DELAY_MS = 18;
+const int SERVO_STEP_SIZE = 2;
 
 // ---------------- CAMERA PINS ----------------
 #define PWDN_GPIO_NUM 32
@@ -52,6 +68,116 @@ long getDistance(int echoPin)
     return -1;
 
   return duration * 0.034 / 2;
+}
+
+int calculateBinFillPercent(long distanceCm)
+{
+  if (distanceCm <= 0)
+  {
+    return -1;
+  }
+
+  float ratio = (BIN_EMPTY_DISTANCE_CM - distanceCm) / (BIN_EMPTY_DISTANCE_CM - BIN_FULL_DISTANCE_CM);
+
+  if (ratio < 0.0F)
+  {
+    ratio = 0.0F;
+  }
+
+  if (ratio > 1.0F)
+  {
+    ratio = 1.0F;
+  }
+
+  return (int)(ratio * 100.0F + 0.5F);
+}
+
+String buildDeviceStatus(bool wifiConnected, long binDistanceCm, int fillPercent)
+{
+  if (!wifiConnected)
+  {
+    return "wifi_disconnected";
+  }
+
+  if (binDistanceCm <= 0 || fillPercent < 0)
+  {
+    return "sensor_unavailable";
+  }
+
+  if (fillPercent >= 90)
+  {
+    return "bin_full";
+  }
+
+  if (fillPercent >= 65)
+  {
+    return "bin_high";
+  }
+
+  return "ready";
+}
+
+void sendHeartbeat(String deviceStatus, long binDistanceCm, int fillPercent)
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("Heartbeat skipped: WiFi disconnected");
+    return;
+  }
+
+  HTTPClient http;
+  http.begin(heartbeatUrl);
+  http.addHeader("Content-Type", "application/json");
+
+  String payload = "{";
+  payload += "\"device_status\":\"" + deviceStatus + "\",";
+  payload += "\"wifi_connected\":true,";
+  payload += "\"bin_distance_cm\":" + String(binDistanceCm) + ",";
+  payload += "\"bin_fill_percent\":" + String(fillPercent);
+  payload += "}";
+
+  int response = http.POST(payload);
+
+  Serial.print("Heartbeat response: ");
+  Serial.println(response);
+
+  if (response > 0)
+  {
+    Serial.println(http.getString());
+  }
+  else
+  {
+    Serial.println("Heartbeat POST failed");
+  }
+
+  http.end();
+}
+
+void moveServoSmoothly(int targetAngle)
+{
+  targetAngle = constrain(targetAngle, 0, 180);
+
+  if (targetAngle == currentServoAngle)
+  {
+    return;
+  }
+
+  int stepDirection = targetAngle > currentServoAngle ? SERVO_STEP_SIZE : -SERVO_STEP_SIZE;
+
+  while ((stepDirection > 0 && currentServoAngle < targetAngle) ||
+         (stepDirection < 0 && currentServoAngle > targetAngle))
+  {
+    currentServoAngle += stepDirection;
+
+    if ((stepDirection > 0 && currentServoAngle > targetAngle) ||
+        (stepDirection < 0 && currentServoAngle < targetAngle))
+    {
+      currentServoAngle = targetAngle;
+    }
+
+    myServo.write(currentServoAngle);
+    delay(SERVO_STEP_DELAY_MS);
+  }
 }
 
 // ---------------- CAMERA INIT ----------------
@@ -120,7 +246,7 @@ String sendImage()
   }
 
   HTTPClient http;
-  http.begin(serverUrl);
+  http.begin(predictUrl);
   http.addHeader("Content-Type", "application/octet-stream");
 
   Serial.println("Sending image...");
@@ -162,7 +288,7 @@ void setup()
   pinMode(ECHO_BIN, INPUT);
 
   myServo.attach(SERVO_PIN);
-  myServo.write(90);
+  myServo.write(currentServoAngle);
 
   WiFi.begin(ssid, password);
 
@@ -176,6 +302,18 @@ void setup()
   Serial.println("\nWiFi connected");
 
   initCamera();
+
+  long initialBin = getDistance(ECHO_BIN);
+  if (initialBin > 0)
+  {
+    lastValidBinDistance = initialBin;
+  }
+
+  long reportedBinDistance = lastValidBinDistance > 0 ? lastValidBinDistance : initialBin;
+  int binFillPercent = calculateBinFillPercent(reportedBinDistance);
+  String deviceStatus = buildDeviceStatus(WiFi.status() == WL_CONNECTED, reportedBinDistance, binFillPercent);
+  sendHeartbeat(deviceStatus, reportedBinDistance, binFillPercent);
+  lastHeartbeatSentAt = millis();
 }
 
 // ---------------- LOOP ----------------
@@ -184,14 +322,45 @@ void loop()
   long front = getDistance(ECHO_FRONT);
   delay(100); // IMPORTANT: avoid sensor interference
   long bin = getDistance(ECHO_BIN);
+  if (bin > 0)
+  {
+    lastValidBinDistance = bin;
+  }
+
+  long reportedBinDistance = lastValidBinDistance > 0 ? lastValidBinDistance : bin;
+  int binFillPercent = calculateBinFillPercent(reportedBinDistance);
+  String deviceStatus = buildDeviceStatus(WiFi.status() == WL_CONNECTED, reportedBinDistance, binFillPercent);
 
   Serial.print("Front: ");
   Serial.print(front);
   Serial.print(" | Bin: ");
-  Serial.println(bin);
+  Serial.print(bin);
+  Serial.print(" | FrontState: ");
+  if (front > 0 && front <= FRONT_OBJECT_DETECTED_CM)
+  {
+    Serial.print("object");
+  }
+  else if (front >= FRONT_CLEAR_CM)
+  {
+    Serial.print("clear");
+  }
+  else
+  {
+    Serial.print("transition");
+  }
+  Serial.print(" | Fill: ");
+  if (binFillPercent >= 0)
+  {
+    Serial.print(binFillPercent);
+    Serial.println("%");
+  }
+  else
+  {
+    Serial.println("unavailable");
+  }
 
   // -------- OBJECT DETECTION --------
-  if (front > 0 && front < 15 && !detected)
+  if (front > 0 && front <= FRONT_OBJECT_DETECTED_CM && !detected)
   {
     detected = true;
 
@@ -206,27 +375,33 @@ void loop()
     if (prediction == "bio")
     {
       Serial.println("BIO → LEFT");
-      myServo.write(0);
+      moveServoSmoothly(SERVO_LEFT_ANGLE);
     }
     else if (prediction == "nonbio")
     {
       Serial.println("NONBIO → RIGHT");
-      myServo.write(180);
+      moveServoSmoothly(SERVO_RIGHT_ANGLE);
     }
 
     delay(2000);
-    myServo.write(90);
+    moveServoSmoothly(SERVO_CENTER_ANGLE);
   }
 
-  if (front > 25)
+  if (front < 0 || front >= FRONT_CLEAR_CM)
   {
     detected = false;
   }
 
   // -------- BIN LEVEL CHECK --------
-  if (bin > 0 && bin < 5)
+  if (binFillPercent >= 90)
   {
     Serial.println("⚠️ BIN FULL");
+  }
+
+  if (millis() - lastHeartbeatSentAt >= HEARTBEAT_INTERVAL_MS)
+  {
+    sendHeartbeat(deviceStatus, reportedBinDistance, binFillPercent);
+    lastHeartbeatSentAt = millis();
   }
 
   delay(2000);

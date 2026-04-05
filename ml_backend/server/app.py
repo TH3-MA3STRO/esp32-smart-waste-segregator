@@ -33,6 +33,8 @@ IMAGE_SIZE = tuple(SETTINGS["image_size"])
 HOST = str(SETTINGS["host"])
 PORT = int(SETTINGS["port"])
 HEARTBEAT_TIMEOUT_SECONDS = int(SETTINGS.get("heartbeat_timeout_seconds", 150))
+BIN_EMPTY_DISTANCE_CM = float(SETTINGS.get("bin_empty_distance_cm", 10.5))
+BIN_FULL_DISTANCE_CM = float(SETTINGS.get("bin_full_distance_cm", 2.0))
 
 app = Flask(__name__)
 
@@ -53,7 +55,18 @@ def ensure_directories() -> None:
     if not DETECTIONS_PATH.exists():
         DETECTIONS_PATH.write_text('{"detections": []}\n', encoding="utf-8")
     if not DEVICE_STATE_PATH.exists():
-        DEVICE_STATE_PATH.write_text('{"last_heartbeat_at": null}\n', encoding="utf-8")
+        DEVICE_STATE_PATH.write_text(
+            (
+                "{\n"
+                '  "last_heartbeat_at": null,\n'
+                '  "device_status": "unknown",\n'
+                '  "wifi_connected": false,\n'
+                '  "bin_distance_cm": null,\n'
+                '  "bin_fill_percent": null\n'
+                "}\n"
+            ),
+            encoding="utf-8",
+        )
 
 
 def load_labels() -> list[str]:
@@ -140,6 +153,52 @@ def count_received_images() -> int:
     return sum(1 for path in RECEIVED_DIR.iterdir() if path.is_file() and path.suffix.lower() in image_suffixes)
 
 
+def calculate_bin_fill_percent(distance_cm: float | int | None) -> int | None:
+    if distance_cm is None:
+        return None
+
+    try:
+        distance = float(distance_cm)
+    except (TypeError, ValueError):
+        return None
+
+    if distance <= 0:
+        return None
+
+    ratio = (BIN_EMPTY_DISTANCE_CM - distance) / (BIN_EMPTY_DISTANCE_CM - BIN_FULL_DISTANCE_CM)
+    clamped = max(0.0, min(1.0, ratio))
+    return round(clamped * 100)
+
+
+def build_bin_state(distance_cm: float | int | None, fill_percent: int | None) -> dict[str, object]:
+    if fill_percent is None:
+        fill_percent = calculate_bin_fill_percent(distance_cm)
+
+    if fill_percent is None:
+        return {
+            "distance_cm": None,
+            "fill_percent": None,
+            "detail": "No recent bin sensor reading available.",
+            "empty_distance_cm": BIN_EMPTY_DISTANCE_CM,
+            "full_distance_cm": BIN_FULL_DISTANCE_CM,
+        }
+
+    if fill_percent >= 90:
+        detail = "Bin is nearly full and should be emptied soon."
+    elif fill_percent >= 60:
+        detail = "Bin is over half full."
+    else:
+        detail = "Bin has remaining space."
+
+    return {
+        "distance_cm": float(distance_cm) if distance_cm is not None else None,
+        "fill_percent": fill_percent,
+        "detail": detail,
+        "empty_distance_cm": BIN_EMPTY_DISTANCE_CM,
+        "full_distance_cm": BIN_FULL_DISTANCE_CM,
+    }
+
+
 def load_device_state() -> dict[str, object]:
     try:
         payload = json.loads(DEVICE_STATE_PATH.read_text(encoding="utf-8"))
@@ -152,11 +211,22 @@ def load_device_state() -> dict[str, object]:
     return payload
 
 
-def write_device_state(*, heartbeat_at: datetime | None) -> None:
+def write_device_state(
+    *,
+    heartbeat_at: datetime | None,
+    device_status: str = "unknown",
+    wifi_connected: bool = False,
+    bin_distance_cm: float | int | None = None,
+    bin_fill_percent: int | None = None,
+) -> None:
     DEVICE_STATE_PATH.write_text(
         json.dumps(
             {
                 "last_heartbeat_at": heartbeat_at.isoformat(timespec="seconds") if heartbeat_at else None,
+                "device_status": device_status,
+                "wifi_connected": wifi_connected,
+                "bin_distance_cm": bin_distance_cm,
+                "bin_fill_percent": bin_fill_percent,
             },
             indent=2,
         )
@@ -168,12 +238,19 @@ def write_device_state(*, heartbeat_at: datetime | None) -> None:
 def get_device_status() -> dict[str, object]:
     device_state = load_device_state()
     last_heartbeat_raw = device_state.get("last_heartbeat_at")
+    device_status = str(device_state.get("device_status") or "unknown")
+    wifi_connected = bool(device_state.get("wifi_connected"))
+    bin_distance_cm = device_state.get("bin_distance_cm")
+    bin_fill_percent = device_state.get("bin_fill_percent")
 
     if not isinstance(last_heartbeat_raw, str) or not last_heartbeat_raw:
         return {
             "online": False,
             "last_heartbeat_at": None,
             "timeout_seconds": HEARTBEAT_TIMEOUT_SECONDS,
+            "device_status": device_status,
+            "wifi_connected": wifi_connected,
+            "bin": build_bin_state(bin_distance_cm, bin_fill_percent),
         }
 
     try:
@@ -183,6 +260,9 @@ def get_device_status() -> dict[str, object]:
             "online": False,
             "last_heartbeat_at": None,
             "timeout_seconds": HEARTBEAT_TIMEOUT_SECONDS,
+            "device_status": device_status,
+            "wifi_connected": wifi_connected,
+            "bin": build_bin_state(bin_distance_cm, bin_fill_percent),
         }
 
     now = datetime.now()
@@ -191,6 +271,9 @@ def get_device_status() -> dict[str, object]:
         "online": online,
         "last_heartbeat_at": last_heartbeat_at.isoformat(timespec="seconds"),
         "timeout_seconds": HEARTBEAT_TIMEOUT_SECONDS,
+        "device_status": device_status,
+        "wifi_connected": wifi_connected,
+        "bin": build_bin_state(bin_distance_cm, bin_fill_percent),
     }
 
 
@@ -225,12 +308,29 @@ def status() -> tuple[dict[str, object], int]:
 
 @app.post("/device/heartbeat")
 def device_heartbeat() -> tuple[dict[str, object], int]:
+    payload = request.get_json(silent=True) or {}
     heartbeat_at = datetime.now()
-    write_device_state(heartbeat_at=heartbeat_at)
+    device_status = str(payload.get("device_status") or "unknown")
+    wifi_connected = bool(payload.get("wifi_connected", False))
+    bin_distance_cm = payload.get("bin_distance_cm")
+    bin_fill_percent = payload.get("bin_fill_percent")
+
+    if bin_fill_percent is None:
+        bin_fill_percent = calculate_bin_fill_percent(bin_distance_cm)
+
+    write_device_state(
+        heartbeat_at=heartbeat_at,
+        device_status=device_status,
+        wifi_connected=wifi_connected,
+        bin_distance_cm=bin_distance_cm,
+        bin_fill_percent=bin_fill_percent,
+    )
     return {
         "status": "ok",
         "received_at": heartbeat_at.isoformat(timespec="seconds"),
         "timeout_seconds": HEARTBEAT_TIMEOUT_SECONDS,
+        "device_status": device_status,
+        "bin": build_bin_state(bin_distance_cm, bin_fill_percent),
     }, 200
 
 

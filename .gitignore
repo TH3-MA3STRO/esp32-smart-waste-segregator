@@ -41,11 +41,8 @@ ml_backend/received/
 ml_backend/.python/
 ml_backend/.venv/
 ml_backend/.python-version
-ml_backend/models/*.h5
-ml_backend/models/*.keras
-ml_backend/models/*.tflite
-ml_backend/models/*.pb
 ml_backend/models/saved_model/
+
 
 # Logs
 *.log
