@@ -23,6 +23,7 @@ htmlcov/
 venv/
 .python/
 .python-version
+!ml_backend/.python-version
 
 # Local secrets/config overrides
 .env
@@ -40,7 +41,6 @@ ml_backend/images/
 ml_backend/received/
 ml_backend/.python/
 ml_backend/.venv/
-ml_backend/.python-version
 ml_backend/models/saved_model/
 
 
